@@ -246,20 +246,68 @@ def apply_origin_rules(
 def protocol_settings(protocol: str, user_uuid: str) -> Dict[str, Any]:
     if protocol == "vless":
         return {
-            "clients": [{"id": user_uuid, "flow": ""}],
+            "clients": [{"id": user_uuid, "flow": "", "email": ""}],
             "decryption": "none",
             "fallbacks": [],
         }
     if protocol == "trojan":
         return {
-            "clients": [{"password": user_uuid, "flow": ""}],
+            "clients": [{"password": user_uuid, "flow": "", "email": ""}],
             "fallbacks": [],
         }
     if protocol == "vmess":
         return {
-            "clients": [{"id": user_uuid, "alterId": 0}],
+            "clients": [{"id": user_uuid, "alterId": 0, "email": ""}],
         }
     raise ValueError(f"不支持的协议: {protocol}")
+
+
+def normalize_existing_inbound_client_email(db_path: str) -> None:
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error as e:
+        exit_error(str(e))
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, settings FROM inbounds WHERE protocol IN ('vless','trojan','vmess')"
+        )
+        rows = cursor.fetchall()
+        changed: List[tuple[str, int]] = []
+        for row in rows:
+            inbound_id = int(row[0])
+            settings_text = str(row[1] or "")
+            try:
+                payload = json.loads(settings_text or "{}")
+            except json.JSONDecodeError:
+                continue
+            clients = payload.get("clients")
+            if not isinstance(clients, list):
+                continue
+
+            updated = False
+            for client in clients:
+                if not isinstance(client, dict):
+                    continue
+                if client.get("email") is None:
+                    client["email"] = ""
+                    updated = True
+                elif "email" not in client:
+                    client["email"] = ""
+                    updated = True
+
+            if updated:
+                changed.append((json.dumps(payload, separators=(",", ":")), inbound_id))
+
+        if changed:
+            cursor.executemany("UPDATE inbounds SET settings=? WHERE id=?", changed)
+            conn.commit()
+    except sqlite3.Error as e:
+        print(str(e))
+        sys.exit(1)
+    finally:
+        conn.close()
 
 
 def ws_stream_settings(path: str) -> Dict[str, Any]:
@@ -820,6 +868,7 @@ def uninstall_last_config(state: Dict[str, Any], headers: Dict[str, str]) -> Non
 
 
 def main() -> None:
+    normalize_existing_inbound_client_email(DB_PATH)
     mode = parse_mode(input("模式(1=安装,2=卸载,3=查看上次订阅，回车=安装): "))
     last_state = load_last_state()
 
