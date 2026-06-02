@@ -31,7 +31,6 @@ PROTOCOL_LABEL = {"vless": "VLESS", "trojan": "TROJAN", "vmess": "VMESS"}
 PROTOCOL_QUERY_FLAG = {"vless": "ev", "trojan": "et", "vmess": "evm"}
 MANAGED_RULE_PREFIX = "3x-ui-auto "
 MANAGED_TAG_RE = re.compile(r"^([0-9a-f]{8})-(vless|trojan|vmess)$", re.I)
-CLIENT_EMAIL_DOMAIN = "cf-auto.local"
 PANEL_API_PREFIX = "panel/api"
 BACKEND_DB = "db"
 BACKEND_API = "api"
@@ -771,7 +770,8 @@ def apply_origin_rules(
 
 
 def client_email_for_route(short_id: str, protocol: str) -> str:
-    return f"{short_id.lower()}-{protocol.lower()}@{CLIENT_EMAIL_DOMAIN}"
+    """3x-ui 客户端 email：小写字母数字，无 @，与面板校验一致。"""
+    return f"{short_id.lower()}{PROTOCOL_SUFFIX[protocol]}"
 
 
 def now_ms() -> int:
@@ -791,17 +791,18 @@ def has_v3_client_schema(conn: sqlite3.Connection) -> bool:
     return table_exists(conn, "clients") and table_exists(conn, "client_inbounds")
 
 
-def inbound_client_entry(protocol: str, user_uuid: str, email: str) -> Dict[str, Any]:
+def inbound_client_entry(protocol: str, user_uuid: str, email: str, *, v3: bool = True) -> Dict[str, Any]:
     entry: Dict[str, Any] = {
         "email": email,
         "limitIp": 0,
         "totalGB": 0,
         "expiryTime": 0,
         "enable": True,
-        "tgId": "",
         "subId": "",
+        "comment": "",
         "reset": 0,
         "flow": "",
+        "tgId": 0 if v3 else "",
     }
     if protocol == "vless":
         entry["id"] = user_uuid
@@ -816,12 +817,18 @@ def inbound_client_entry(protocol: str, user_uuid: str, email: str) -> Dict[str,
     return entry
 
 
-def protocol_settings(protocol: str, user_uuid: str, email: str) -> Dict[str, Any]:
-    client = inbound_client_entry(protocol, user_uuid, email)
+def ensure_vless_crypto_fields(payload: Dict[str, Any]) -> None:
+    payload["decryption"] = "none"
+    payload["encryption"] = "none"
+
+
+def protocol_settings(protocol: str, user_uuid: str, email: str, *, v3: bool = True) -> Dict[str, Any]:
+    client = inbound_client_entry(protocol, user_uuid, email, v3=v3)
     if protocol == "vless":
         return {
             "clients": [client],
             "decryption": "none",
+            "encryption": "none",
             "fallbacks": [],
         }
     if protocol == "trojan":
@@ -1024,7 +1031,37 @@ def repair_v3_missing_client_bindings(
                 clients = payload.get("clients")
                 if isinstance(clients, list) and clients and isinstance(clients[0], dict):
                     clients[0]["email"] = email
+                    clients[0]["enable"] = True
+                    if protocol == "vmess":
+                        clients[0]["security"] = "auto"
+                    clients[0]["tgId"] = 0
                     payload["clients"] = clients
+                    if protocol == "vless":
+                        ensure_vless_crypto_fields(payload)
+                    cursor.execute(
+                        "UPDATE inbounds SET settings=? WHERE id=?",
+                        (json.dumps(payload, separators=(",", ":")), inbound_id),
+                    )
+            else:
+                payload = json.loads(settings_text or "{}")
+                changed = False
+                if protocol == "vless":
+                    old_d, old_e = payload.get("decryption"), payload.get("encryption")
+                    ensure_vless_crypto_fields(payload)
+                    if old_d != "none" or old_e != "none":
+                        changed = True
+                clients = payload.get("clients")
+                if isinstance(clients, list) and clients and isinstance(clients[0], dict):
+                    c0 = clients[0]
+                    if c0.get("enable") is False:
+                        c0["enable"] = True
+                        changed = True
+                    if protocol == "vmess" and not str(c0.get("security") or "").strip():
+                        c0["security"] = "auto"
+                        changed = True
+                    if changed:
+                        payload["clients"] = clients
+                if changed:
                     cursor.execute(
                         "UPDATE inbounds SET settings=? WHERE id=?",
                         (json.dumps(payload, separators=(",", ":")), inbound_id),
@@ -1085,6 +1122,7 @@ def protocol_settings_legacy(protocol: str, user_uuid: str) -> Dict[str, Any]:
         return {
             "clients": [{"id": user_uuid, "flow": "", "email": ""}],
             "decryption": "none",
+            "encryption": "none",
             "fallbacks": [],
         }
     if protocol == "trojan":
@@ -1136,6 +1174,8 @@ def normalize_existing_inbound_client_email(db_path: str) -> None:
                         client["email"] = derived
                         updated = True
                         continue
+                if not email and v3_schema:
+                    continue
                 if client.get("email") is None:
                     client["email"] = ""
                     updated = True
@@ -1210,7 +1250,7 @@ def build_inbound_payload(protocol: str, user_uuid: str, short_id: str, route: D
         "protocol": protocol,
         "expiryTime": 0,
         "tag": f"{short_id}-{protocol}",
-        "settings": json.dumps(protocol_settings(protocol, user_uuid, email), separators=(",", ":")),
+        "settings": json.dumps(protocol_settings(protocol, user_uuid, email, v3=True), separators=(",", ":")),
         "streamSettings": json.dumps(ws_stream_settings(route["path"]), separators=(",", ":")),
         "sniffing": json.dumps(sniffing_settings(), separators=(",", ":")),
     }
@@ -1348,7 +1388,7 @@ def insert_inbounds_db(
             protocol = route["protocol"]
             email = client_email_for_route(short_id, protocol)
             settings = (
-                protocol_settings(protocol, user_uuid, email)
+                protocol_settings(protocol, user_uuid, email, v3=True)
                 if v3_schema
                 else protocol_settings_legacy(protocol, user_uuid)
             )
