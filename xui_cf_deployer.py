@@ -17,9 +17,18 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error, parse, request
 from urllib.request import HTTPCookieProcessor, HTTPSHandler, build_opener
 
+try:
+    import termios
+    import tty
+
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
+
 
 DB_PATH = "/etc/x-ui/x-ui.db"
 STATE_PATH = "/etc/x-ui/cf_auto_state.json"
+CF_ACCOUNT_PATH = "/etc/x-ui/cf_account.json"
 PANEL_INFO_PATH = "/etc/x-ui/cf_panel_access.json"
 LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
 PANEL_INFO_SNAPSHOT = os.path.join(os.getcwd(), "cf_panel_last_access.txt")
@@ -145,6 +154,82 @@ def call_cf_api(
         print(json.dumps(errors, ensure_ascii=False))
         sys.exit(1)
     return result.get("result")
+
+
+def call_cf_api_result(
+    method: str,
+    endpoint: str,
+    headers: Dict[str, str],
+    data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return call_json_api(
+        method=method,
+        url=f"{CF_API_BASE}{endpoint}",
+        headers=headers,
+        data=data,
+        exit_on_http_error=False,
+    )
+
+
+def build_cf_headers(email: str, api_key: str) -> Dict[str, str]:
+    return {
+        "X-Auth-Email": email,
+        "X-Auth-Key": api_key,
+        "Content-Type": "application/json",
+    }
+
+
+def load_cf_account() -> Optional[Dict[str, str]]:
+    if not os.path.isfile(CF_ACCOUNT_PATH):
+        return None
+    try:
+        with open(CF_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    email = str(data.get("email", "")).strip()
+    api_key = str(data.get("api_key", "")).strip()
+    if not email or not api_key:
+        return None
+    return {"email": email, "api_key": api_key}
+
+
+def save_cf_account(email: str, api_key: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(CF_ACCOUNT_PATH), exist_ok=True)
+        with open(CF_ACCOUNT_PATH, "w", encoding="utf-8") as f:
+            json.dump({"email": email, "api_key": api_key}, f, ensure_ascii=False, indent=2)
+        os.chmod(CF_ACCOUNT_PATH, 0o600)
+    except OSError as e:
+        exit_error(f"保存 Cloudflare 凭据失败: {e}")
+
+
+def prompt_cf_credentials() -> Tuple[str, str]:
+    env_email = os.environ.get("CF_EMAIL", "").strip()
+    env_key = (
+        os.environ.get("CF_API_KEY", "").strip()
+        or os.environ.get("CF_GLOBAL_API_KEY", "").strip()
+    )
+    if env_email and env_key:
+        save_cf_account(env_email, env_key)
+        return env_email, env_key
+
+    saved = load_cf_account()
+    if saved:
+        print(f"Cloudflare 账号: {saved['email']} (已保存本地)")
+        answer = input("使用已保存凭据? (Y/n): ").strip().lower()
+        if answer in ("", "y", "yes"):
+            return saved["email"], saved["api_key"]
+
+    email = input("Cloudflare 邮箱: ").strip()
+    api_key = getpass("Cloudflare Global API Key: ").strip()
+    if not email or not api_key:
+        exit_error("Cloudflare 邮箱和 API Key 不能为空")
+    save_cf_account(email, api_key)
+    print(f"Cloudflare 凭据已保存到 {CF_ACCOUNT_PATH}")
+    return email, api_key
 
 
 class XuiPanelClient:
@@ -639,16 +724,182 @@ def print_xui_management_help() -> None:
     print("\n".join(lines))
 
 
-def build_mode_prompt() -> str:
-    options = ["1=安装", "2=卸载", "3=查看订阅"]
+def build_mode_menu_items() -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = [
+        ("install", "安装节点"),
+        ("uninstall", "卸载"),
+        ("show", "查看订阅"),
+    ]
     if not is_xui_installed():
-        options.append("4=全新安装(含x-ui)")
+        items.append(("fresh", "全新安装(含 x-ui)"))
     if has_script_installed_panel():
-        options.append("5=查看面板")
+        items.append(("panel", "查看面板"))
     if is_xui_installed():
-        options.append("6=面板管理命令")
-    default = "全新安装" if not is_xui_installed() else "安装"
-    return f"模式({','.join(options)},回车={default}): "
+        items.append(("xui_manage", "面板管理命令"))
+    return items
+
+
+def default_mode_index(items: List[Tuple[str, str]]) -> int:
+    preferred = "fresh" if not is_xui_installed() else "install"
+    for i, (mode_id, _) in enumerate(items):
+        if mode_id == preferred:
+            return i
+    return 0
+
+
+def parse_mode(raw: str, items: Optional[List[Tuple[str, str]]] = None) -> str:
+    menu = items or build_mode_menu_items()
+    text = raw.strip().lower()
+    if text == "":
+        return menu[default_mode_index(menu)][0]
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(menu):
+            return menu[idx][0]
+    aliases = {
+        "install": "install",
+        "i": "install",
+        "安装": "install",
+        "uninstall": "uninstall",
+        "u": "uninstall",
+        "卸载": "uninstall",
+        "show": "show",
+        "view": "show",
+        "v": "show",
+        "查看": "show",
+        "查看订阅": "show",
+        "fresh": "fresh",
+        "setup": "fresh",
+        "全新": "fresh",
+        "全新安装": "fresh",
+        "安装x-ui": "fresh",
+        "panel": "panel",
+        "面板": "panel",
+        "查看面板": "panel",
+        "xui": "xui_manage",
+        "manage": "xui_manage",
+        "管理": "xui_manage",
+        "管理命令": "xui_manage",
+        "面板管理": "xui_manage",
+    }
+    mode_id = aliases.get(text)
+    if mode_id and any(item[0] == mode_id for item in menu):
+        return mode_id
+    valid = " / ".join(str(i + 1) for i in range(len(menu)))
+    exit_error(f"无效模式，请输入 {valid}")
+
+
+def _read_nav_key() -> str:
+    if not HAS_TERMIOS:
+        return "enter"
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A":
+                    return "up"
+                if seq == "[B":
+                    return "down"
+                if seq == "[C":
+                    return "right"
+                if seq == "[D":
+                    return "left"
+                continue
+            if ch in ("k", "K"):
+                return "up"
+            if ch in ("j", "J"):
+                return "down"
+            if ch in ("h", "H"):
+                return "left"
+            if ch in ("l", "L"):
+                return "right"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _mode_menu_line_count(items: List[Tuple[str, str]]) -> int:
+    # 标题 + 空行 + 选项 + 空行 + 底部提示
+    return 2 + len(items) + 2
+
+
+def _render_mode_menu(items: List[Tuple[str, str]], index: int, *, redraw: bool) -> None:
+    if redraw:
+        sys.stdout.write(f"\033[{_mode_menu_line_count(items)}A")
+
+    lines = [
+        "请选择模式 (↑↓←→ 移动, 回车确认):",
+        "",
+    ]
+    for i, (_, label) in enumerate(items):
+        if i == index:
+            lines.append(f"  \033[1;36m> {label}\033[0m")
+        else:
+            lines.append(f"    {label}")
+    lines.extend(["", "↑↓←→ 移动  回车 确认"])
+
+    for line in lines:
+        sys.stdout.write("\033[2K\r")
+        sys.stdout.write(f"{line}\n")
+    sys.stdout.flush()
+
+
+def select_mode_plain(items: List[Tuple[str, str]]) -> str:
+    default_idx = default_mode_index(items)
+    print("请选择模式:")
+    for i, (_, label) in enumerate(items, 1):
+        marker = " (默认)" if i - 1 == default_idx else ""
+        print(f"  {i}. {label}{marker}")
+    raw = input(f"输入序号 (回车={items[default_idx][1]}): ")
+    return parse_mode(raw, items)
+
+
+def select_mode_cursor(items: List[Tuple[str, str]]) -> str:
+    index = default_mode_index(items)
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+    _render_mode_menu(items, index, redraw=False)
+    while True:
+        key = _read_nav_key()
+        if key in ("up", "left"):
+            index = (index - 1) % len(items)
+            _render_mode_menu(items, index, redraw=True)
+            continue
+        if key in ("down", "right"):
+            index = (index + 1) % len(items)
+            _render_mode_menu(items, index, redraw=True)
+            continue
+        if key == "enter":
+            sys.stdout.write("\033[?25h\n")
+            sys.stdout.flush()
+            return items[index][0]
+
+
+def select_mode_interactive() -> str:
+    items = build_mode_menu_items()
+    if not items:
+        exit_error("无可用模式")
+    use_plain = (
+        not sys.stdin.isatty()
+        or not HAS_TERMIOS
+        or os.environ.get("CFD_PLAIN_MENU", "").strip().lower() in ("1", "true", "yes", "y")
+    )
+    if use_plain:
+        return select_mode_plain(items)
+    try:
+        return select_mode_cursor(items)
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+        print("已取消")
+        sys.exit(130)
 
 
 def panel_tls_insecure(panel_url: str, panel_https: bool) -> bool:
@@ -1028,11 +1279,27 @@ def build_origin_rules(domain: str, routes: List[Dict[str, Any]]) -> List[Dict[s
     return rules
 
 
-def strip_managed_origin_rules(rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    filtered = []
+def managed_origin_rule_for_domain(rule: Dict[str, Any], domain: str) -> bool:
+    if not str(rule.get("description", "")).startswith(MANAGED_RULE_PREFIX):
+        return False
+    host = domain.strip().lower()
+    expr = str(rule.get("expression", "")).lower()
+    return f'http.host eq "{host}"' in expr
+
+
+def strip_managed_origin_rules(
+    rules: List[Dict[str, Any]], domain: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    host = domain.strip().lower() if domain else None
+    filtered: List[Dict[str, Any]] = []
     for rule in rules:
         description = str(rule.get("description", ""))
-        if description.startswith(MANAGED_RULE_PREFIX):
+        if not description.startswith(MANAGED_RULE_PREFIX):
+            filtered.append(rule)
+            continue
+        if host and managed_origin_rule_for_domain(rule, host):
+            continue
+        if host is None:
             continue
         filtered.append(rule)
     return filtered
@@ -1054,21 +1321,104 @@ def get_origin_rules(zone_id: str, headers: Dict[str, str]) -> List[Dict[str, An
     return []
 
 
+def origin_rule_host(rule: Dict[str, Any]) -> str:
+    expr = str(rule.get("expression", ""))
+    match = re.search(r'http\.host eq "([^"]+)"', expr, re.I)
+    return match.group(1) if match else "?"
+
+
+def origin_rule_port(rule: Dict[str, Any]) -> str:
+    origin = ((rule.get("action_parameters") or {}).get("origin") or {})
+    port = origin.get("port")
+    return str(port) if port is not None else "?"
+
+
+def is_origin_rule_limit_error(result: Dict[str, Any]) -> bool:
+    for item in result.get("errors") or []:
+        message = str(item.get("message", "")).lower()
+        if any(
+            token in message
+            for token in ("limit", "quota", "maximum", "exceeded", "too many", "规则")
+        ):
+            return True
+        try:
+            if int(item.get("code", 0)) in (10006, 20127, 20217):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def format_origin_rule_line(index: int, rule: Dict[str, Any]) -> str:
+    description = str(rule.get("description") or "(无描述)")
+    host = origin_rule_host(rule)
+    port = origin_rule_port(rule)
+    kind = "脚本" if description.startswith(MANAGED_RULE_PREFIX) else "其他"
+    path_match = re.search(r'http\.request\.uri\.path eq "([^"]+)"', str(rule.get("expression", "")))
+    path = path_match.group(1) if path_match else ""
+    extra = f" path={path}" if path else ""
+    return f"{index}. [{kind}] {host}{extra} -> :{port} | {description}"
+
+
+def prompt_delete_origin_rules(rules: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    if not rules:
+        exit_error("Origin Rules 为空，无法继续")
+
+    print("\nCloudflare Origin Rules 已达额度上限，请删除部分规则后重试：")
+    for i, rule in enumerate(rules, 1):
+        print(format_origin_rule_line(i, rule))
+
+    raw = input("\n请输入要删除的序号(逗号分隔，回车=取消): ").strip()
+    if not raw:
+        return None
+
+    remove_indexes: Set[int] = set()
+    for token in raw.replace(" ", "").split(","):
+        if not token:
+            continue
+        if not token.isdigit():
+            exit_error(f"无效序号: {token}")
+        idx = int(token)
+        if idx < 1 or idx > len(rules):
+            exit_error(f"序号超出范围: {idx}")
+        remove_indexes.add(idx)
+
+    if not remove_indexes:
+        return None
+
+    kept = [rule for i, rule in enumerate(rules, 1) if i not in remove_indexes]
+    print(f"将删除 {len(remove_indexes)} 条规则，保留 {len(kept)} 条")
+    return kept
+
+
 def put_origin_rules(zone_id: str, headers: Dict[str, str], rules: List[Dict[str, Any]]) -> None:
     payload = {"rules": rules}
-    call_cf_api(
+    result = call_cf_api_result(
         "PUT",
         f"/zones/{zone_id}/rulesets/phases/http_request_origin/entrypoint",
         headers=headers,
         data=payload,
     )
+    if result.get("success", False):
+        return
+    if is_origin_rule_limit_error(result):
+        errors = result.get("errors") or [{"message": "Origin Rules 已达额度上限"}]
+        print(json.dumps(errors, ensure_ascii=False))
+        next_rules = prompt_delete_origin_rules(rules)
+        if next_rules is None:
+            exit_error("已取消删除 Origin Rules")
+        put_origin_rules(zone_id, headers, next_rules)
+        return
+    errors = result.get("errors") or [{"message": "Cloudflare API 未知错误"}]
+    print(json.dumps(errors, ensure_ascii=False))
+    sys.exit(1)
 
 
 def apply_origin_rules(
     zone_id: str, headers: Dict[str, str], domain: str, routes: List[Dict[str, Any]]
 ) -> None:
     existing = get_origin_rules(zone_id, headers)
-    next_rules = strip_managed_origin_rules(existing) + build_origin_rules(domain, routes)
+    next_rules = strip_managed_origin_rules(existing, domain) + build_origin_rules(domain, routes)
     put_origin_rules(zone_id, headers, next_rules)
 
 
@@ -1615,25 +1965,6 @@ def parse_protocol_selection(raw: str) -> List[str]:
     if not selected:
         exit_error("至少选择一个协议")
     return selected
-
-
-def parse_mode(raw: str) -> str:
-    text = raw.strip().lower()
-    if text == "":
-        return "fresh" if not is_xui_installed() else "install"
-    if text in ("1", "install", "i", "安装"):
-        return "install"
-    if text in ("2", "uninstall", "u", "卸载"):
-        return "uninstall"
-    if text in ("3", "show", "view", "v", "查看", "查看订阅"):
-        return "show"
-    if text in ("4", "fresh", "setup", "全新", "全新安装", "安装x-ui"):
-        return "fresh"
-    if text in ("5", "panel", "面板", "查看面板"):
-        return "panel"
-    if text in ("6", "xui", "manage", "管理", "管理命令", "面板管理"):
-        return "xui_manage"
-    exit_error("无效模式")
 
 
 def get_inbounds_schema(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -2229,12 +2560,8 @@ def uninstall_last_config(
     if not domain or not zone_id:
         exit_error("上次配置缺少 domain 或 zone_id，无法卸载")
 
-    origin_backup = state.get("origin_rules_backup")
-    if isinstance(origin_backup, list):
-        put_origin_rules(zone_id, headers, origin_backup)
-    else:
-        current_rules = get_origin_rules(zone_id, headers)
-        put_origin_rules(zone_id, headers, strip_managed_origin_rules(current_rules))
+    current_rules = get_origin_rules(zone_id, headers)
+    put_origin_rules(zone_id, headers, strip_managed_origin_rules(current_rules, domain))
 
     ssl_backup = str(state.get("ssl_backup", "")).strip()
     if ssl_backup:
@@ -2276,8 +2603,7 @@ def run_deploy_install() -> None:
         exit_error(f"检测到上次配置({last_domain})，请先执行卸载")
 
     domain = input("绑定域名: ").strip()
-    cf_email = input("Cloudflare 邮箱: ").strip()
-    cf_key = getpass("Cloudflare Global API Key: ").strip()
+    cf_email, cf_key = prompt_cf_credentials()
     selected_protocols = parse_protocol_selection(
         input("创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): ")
     )
@@ -2308,13 +2634,7 @@ def run_deploy_install() -> None:
             }
         )
 
-    headers = {
-        "X-Auth-Email": cf_email,
-        "X-Auth-Key": cf_key,
-        "Content-Type": "application/json",
-    }
-
-    zones = fetch_all_zones(headers)
+    headers = build_cf_headers(cf_email, cf_key)
     zone = find_best_zone(domain, zones)
     if zone is None:
         exit_error(f"无法匹配该域名对应的 Zone: {domain}")
@@ -2372,7 +2692,7 @@ def run_deploy_install() -> None:
 
 def main() -> None:
     ensure_cfd_command()
-    mode = parse_mode(input(build_mode_prompt()))
+    mode = select_mode_interactive()
     prompt_maybe_localize_xui_menu()
     last_state = load_last_state()
 
@@ -2406,15 +2726,8 @@ def main() -> None:
         panel: Optional[XuiPanelClient] = None
         if backend == BACKEND_API:
             panel = setup_panel_client(runtime, interactive=False)
-        cf_email = input("Cloudflare 邮箱: ").strip()
-        cf_key = getpass("Cloudflare Global API Key: ").strip()
-        if not cf_email or not cf_key:
-            exit_error("邮箱和 API Key 不能为空")
-        headers = {
-            "X-Auth-Email": cf_email,
-            "X-Auth-Key": cf_key,
-            "Content-Type": "application/json",
-        }
+        cf_email, cf_key = prompt_cf_credentials()
+        headers = build_cf_headers(cf_email, cf_key)
         uninstall_last_config(last_state, headers, backend, panel=panel)
         remove_last_state()
         print("卸载成功")
